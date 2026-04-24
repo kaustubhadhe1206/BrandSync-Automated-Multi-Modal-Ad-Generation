@@ -8,12 +8,12 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+load_dotenv() # Load this BEFORE importing db_client
+
 from backend.database.firebase_client import db_client
 from backend.workers.orchestrator import handle_firebase_event
 from backend.core.scraper import scrape_url
 from backend.core.brain import generate_style_contract
-
-load_dotenv() 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,7 +25,18 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("Shutting down FastAPI...")
 
+from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI(lifespan=lifespan)
+
+# Add CORS middleware to allow React frontend to communicate with backend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Allow all origins for development
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class GenerateRequest(BaseModel):
     url: str
@@ -49,7 +60,8 @@ async def generate_ad(request: GenerateRequest):
         "status": "pending_generation",
         "style_contract": style_contract,
         "input_url": request.url,
-        "template": request.template
+        "template": request.template,
+        "scraped_data": scraped_data  # Save for future feedback loops
     }
     db_client.set_data(f"/tasks/{task_id}", initial_data)
     
@@ -66,21 +78,30 @@ async def get_status(task_id: str):
 @app.put("/feedback/{task_id}")
 async def submit_feedback(task_id: str, feedback: dict):
     """
-    Simulates Gemini Live processing text/voice and updating the contract.
+    Smarter Feedback Loop: Re-invokes the Brain to update the entire contract based on user instructions.
     """
     data = db_client.get_data(f"/tasks/{task_id}")
     if not data:
         raise HTTPException(status_code=404, detail="Task not found")
         
-    contract = data.get("style_contract", {})
-    contract.update(feedback)
+    scraped_data = data.get("scraped_data", {})
+    feedback_text = feedback.get("feedback_text", "Update the style.")
     
-    db_client.update_data(f"/tasks/{task_id}", {
-        "style_contract": contract,
-        "status": "pending_generation"  # Triggers Orchestrator listener
-    })
-    
-    return {"status": "Updated and re-started generation."}
+    # 1. Re-invoke Gemini Brain with refinement instructions
+    try:
+        new_contract = await asyncio.to_thread(generate_style_contract, scraped_data, feedback_text)
+        logger.info(f"Feedback Loop: Brain has updated the creative contract for {task_id}.")
+        
+        # 2. Trigger fresh generation cycle
+        db_client.update_data(f"/tasks/{task_id}", {
+            "style_contract": new_contract,
+            "template": feedback_text,
+            "status": "pending_generation" 
+        })
+        return {"status": "Refined and re-started generation."}
+    except Exception as e:
+        logger.error(f"Feedback logic failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to refine the creative brief.")
 
 @app.get("/video/{task_id}")
 async def get_video(task_id: str):

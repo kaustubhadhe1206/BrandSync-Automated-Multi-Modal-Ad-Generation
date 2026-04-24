@@ -5,6 +5,9 @@ from typing import Dict, Any, List
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -45,26 +48,17 @@ def generate_style_contract(scraped_data: Dict[str, str], user_template: str = "
         model_name = "gemini-2.5-flash"
 
         prompt = f"""
-        You are the central Brain for an automated Video Ad Generator (BrandSync).
-        Your task is to analyze the scraped content of a business website and an optional user template, 
-        and output a comprehensive 'Style Contract'. This contract will orchestrate downstream generative models 
-        for Images (Nano Banana), Video (Veo), Music (Lyria), and TTS naration.
-
-        CRITICAL INSTRUCTIONS:
-        1. IDENTIFY THE HERO PRODUCT: Look through the scraped text and identify the core product or service being sold. 
-           (e.g., If the website is a pizza place, the hero_product is 'Pizza'. DO NOT suggest 'Sandwiches' or 'Pasta' unless it's a generic food site). 
-        2. VISUAL ACCURACY & BRANDING: All 3 'prompts_for_images' MUST feature this 'hero_product'. 
-           - One image prompt MUST be a clean 'Hero shot' that includes 'Integrated professional [Brand Name] logo and minimalist typography'.
-        3. DYNAMIC TEXT: Create 3 'ad_punchlines' that capture the brand's core value proposition in exactly 2-3 words each.
-        4. PRODUCTION TIMINGS: We are building a **20-second Video Ad**. The 'tts_narration' MUST be exactly 35 words long. NO MORE.
+        You are the lead Creative Director for BrandSync. Analyze the raw scraped website data and instructions. 
         
-        Input Website Data:
-        URL: {scraped_data.get('url')}
-        Title: {scraped_data.get('title')}
-        Description: {scraped_data.get('description')}
-        Content Snippet: {scraped_data.get('content')[:1500]}
+        CRITICAL: DO NOT HALLUCINATE products. 
+        - If the company is a Pizza place (like Dominos), the hero_product is PIZZA. 
+        - DO NOT guess 'Coffee' or 'Gadgets' unless explicitly seen in the text.
+        - If 'User Creative Direction' specifies a style like 'Pixar' or 'Disney', the 'prompts_for_images' and 'visual_style' MUST transition to that aesthetic while REMAINING ON TOPIC for the brand's product.
+        - The 'tts_narration' MUST be exactly 35 words.
 
-        User Template Preference: {user_template if user_template else 'None (Infer from brand content)'}
+        Visual Context: {scraped_data.get('images', [])[:5]}
+        Website Text: {str(scraped_data.get('content'))[:2000]}
+        User Creative Direction (PRIORITY): {user_template if user_template else 'None'}
         """
 
         response = client.models.generate_content(
@@ -73,7 +67,7 @@ def generate_style_contract(scraped_data: Dict[str, str], user_template: str = "
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=StyleContract,
-                temperature=0.7,
+                temperature=0.3,
             ),
         )
         

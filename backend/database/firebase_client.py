@@ -5,6 +5,9 @@ from typing import Callable, Optional
 import firebase_admin
 from firebase_admin import credentials
 from firebase_admin import db
+from dotenv import load_dotenv # Added this
+
+load_dotenv() # Load this BEFORE using os.getenv
 
 logger = logging.getLogger(__name__)
 

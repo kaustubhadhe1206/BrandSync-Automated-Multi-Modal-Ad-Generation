@@ -52,11 +52,18 @@ async def synthesize_ad(task_id: str, video_path: str, image_paths: List[str], a
             ).with_duration(20)
 
             # 6. Audio Mixing
-            bgm = bgm.with_volume_scaled(0.15)
-            tts = tts.with_start(1.0)
-            final_audio = CompositeAudioClip([bgm, tts])
+            bgm = bgm.with_volume_scaled(0.12) # Lower BGM slightly more
             
-            if final_audio.duration > 20:
+            # Ensure TTS has a duration and is audible
+            if tts.duration and tts.duration > 0:
+                tts = tts.with_start(1.0).with_volume_scaled(1.2) # Boost TTS slightly
+                final_audio = CompositeAudioClip([bgm, tts])
+            else:
+                logger.warning("Synthesizer: TTS audio is empty or invalid. Using BGM only.")
+                final_audio = bgm
+            
+            # Ensure final audio captures the full 20s
+            if final_audio.duration is None or final_audio.duration > 20:
                 final_audio = final_audio.subclipped(0, 20)
             
             # 7. Final Export
@@ -65,25 +72,35 @@ async def synthesize_ad(task_id: str, video_path: str, image_paths: List[str], a
                 output_path, 
                 codec='libx264', 
                 audio_codec='aac', 
+                temp_audiofile=f"tmp/temp_audio_{task_id}.m4a",
+                remove_temp=True,
                 logger=None,
                 fps=24
             )
             
-            # Cleanup
-            motion_clip.close()
-            slide1.close()
-            slide2.close()
-            closer.close()
-            bgm.close()
-            tts.close()
-            for tx in text_layers: tx.close()
+            # 8. Cleanup (Wrapped in try-except to avoid crashing after successful export)
+            try:
+                motion_clip.close()
+                slide1.close()
+                slide2.close()
+                closer.close()
+                bgm.close()
+                tts.close()
+                for tx in text_layers: tx.close()
+            except Exception as cleanup_e:
+                logger.warning(f"Synthesizer: Minor cleanup warning: {cleanup_e}")
             
             return output_path
         except Exception as e:
             logger.error(f"Synthesizer Engine Error: {e}")
             raise e
 
-    await asyncio.to_thread(merge_media)
-    logger.info(f"Synthesizer Result: {output_path}")
-
-    return output_path
+    # Run the merger in a thread to keep the event loop responsive
+    result_path = await asyncio.to_thread(merge_media)
+    
+    if result_path:
+        logger.info(f"Synthesizer Result: {result_path}")
+        return result_path
+    else:
+        # Fallback to local path if result is None but execution didn't throw
+        return output_path

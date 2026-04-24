@@ -6,6 +6,9 @@ from moviepy import ColorClip, AudioArrayClip
 from typing import List
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +18,7 @@ os.makedirs("tmp", exist_ok=True)
 from google import genai
 from google.genai import types
 
-async def generate_images_mock(prompts: List[str]) -> List[str]:
+async def generate_images_mock(prompts: List[str], task_id: str) -> List[str]:
     """Generates candidate images using Nano Banana via generate_content."""
     logger.info("Nano Banana: Generating images...")
     try:
@@ -24,17 +27,21 @@ async def generate_images_mock(prompts: List[str]) -> List[str]:
         
         filepaths = []
         for i, prompt in enumerate(prompts):
-            # Nano-banana-pro-preview generates images through generate_content
+            # gemini-3-pro-image-preview is the official model for high-res asset generation
+            # WE MUST specify response_modalities=["IMAGE"] to get the asset
             response = await asyncio.to_thread(
                 client.models.generate_content,
-                model='nano-banana-pro-preview',
-                contents=prompt
+                model='gemini-3-pro-image-preview',
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_modalities=["IMAGE"]
+                )
             )
             
-            filepath = f"tmp/nano_banana_image_{i}.png"
-            # Extract inline_data bytes from the model response parts
-            for part in response.candidates[0].content.parts:
-                if hasattr(part, 'inline_data') and getattr(part, 'inline_data', None):
+            filepath = f"tmp/nano_banana_image_{task_id}_{i}.png"
+            # Extract image bytes from response parts
+            for part in response.parts:
+                if part.inline_data:
                     image_bytes = part.inline_data.data
                     with open(filepath, "wb") as f:
                         f.write(image_bytes)
@@ -45,27 +52,84 @@ async def generate_images_mock(prompts: List[str]) -> List[str]:
         logger.info("Nano Banana: Done.")
         return filepaths
     except Exception as e:
-        logger.error(f"Image generation failed: {e}. Returning mock.")
-        return [f"tmp/mock_image_{i}.jpg" for i in range(len(prompts))]
+        logger.error(f"Image generation failed: {e}. Generating placeholders.")
+        filepaths = []
+        for i in range(len(prompts)):
+            filepath = f"tmp/nano_banana_image_{task_id}_{i}.png"
+            # Create a placeholder image if AI fails
+            img = Image.new('RGB', (1024, 1024), color=(73, 109, 137))
+            d = ImageDraw.Draw(img)
+            try:
+                # Try to use a system font
+                font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 40)
+            except:
+                font = ImageFont.load_default()
+            d.text((100, 450), f"Image Prompt {i+1}:\n{prompts[i][:50]}...", fill=(255, 255, 0), font=font)
+            img.save(filepath)
+            filepaths.append(filepath)
+        return filepaths
 
-async def generate_video_mock(image_path: str, style: str, hero_product: str) -> str:
+async def rank_images(image_paths: List[str], hero_product: str, task_id: str) -> int:
+    """Uses Gemini to visually analyze candidate images and pick the best one."""
+    logger.info(f"Image Ranker: Selecting the best image for '{hero_product}'...")
+    try:
+        api_key = os.getenv("GEMINI_API_KEY")
+        client = genai.Client(api_key=api_key)
+        
+        parts = ["You are the Lead Creative Director. Examine these three images. "
+                 f"Which image MOST clearly, beautifully, and accurately features the product: {hero_product}? "
+                 "Respond with EXACTLY ONE NUMBER: 0, 1, or 2. Provide NO other text."]
+        for path in image_paths[:3]:
+            with open(path, "rb") as f:
+                parts.append(types.Part.from_bytes(data=f.read(), mime_type="image/png"))
+                
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model='gemini-2.5-flash',
+            contents=parts
+        )
+        
+        text = response.text.strip()
+        logger.info(f"Image Ranker chose index: {text}")
+        if text in ["0", "1", "2"]:
+            return int(text)
+            
+        for char in text:
+            if char in ["0", "1", "2"]:
+                return int(char)
+                
+        return 0
+    except Exception as e:
+        logger.error(f"Image Ranker failed: {e}. Defaulting to image 0.")
+        return 0
+
+async def generate_video_mock(image_path: str, style: str, hero_product: str, task_id: str) -> str:
     """Generates video using Veo 3.0 based on the image style."""
     logger.info(f"Veo 3: Generating video for {hero_product}...")
-    filepath = f"tmp/veo_video.mp4"
+    filepath = f"tmp/veo_video_{task_id}.mp4"
     try:
         api_key = os.getenv("GEMINI_API_KEY")
         client = genai.Client(api_key=api_key)
         
         prompt = f"Make this image move cinematically featuring a {hero_product} in the style of: {style}"
         
-        # 1. Initial Request with Retry for 503s
+        # 1. Read image bytes for Veo reference
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+        
+        # 2. Initial Request with Retry for 503s
+        # Passing 'image' allows Veo to perform actual image-to-video animation
         response = None
         for attempt in range(3):
             try:
                 response = await asyncio.to_thread(
                     client.models.generate_videos,
                     model='veo-3.0-generate-001',
-                    prompt=prompt
+                    prompt=prompt,
+                    image={
+                        "image_bytes": image_bytes,
+                        "mime_type": "image/png"
+                    }
                 )
                 break
             except Exception as e:
@@ -77,7 +141,7 @@ async def generate_video_mock(image_path: str, style: str, hero_product: str) ->
         
         # Poll operation
         operation = response
-        logger.info("Veo: Waiting for operation to complete in the cloud...")
+        logger.info("Veo: Waiting for cinematic motion generation in the cloud...")
         max_retries = 60 # roughly 5 minutes for video
         retries = 0
         done = False
@@ -85,24 +149,29 @@ async def generate_video_mock(image_path: str, style: str, hero_product: str) ->
         
         while retries < max_retries:
             try:
-                op_dict = operation.to_json_dict()
-                if op_dict.get('done') is True:
+                # Refresh operation status using SDK native check.
+                # Crucial Fix: The SDK expects the Operation object itself, not a string ID.
+                # Passing a string causes the internal SDK to crash when it tries to check .name
+                operation = await asyncio.to_thread(client.operations.get, operation)
+                
+                if operation.done:
                     done = True
-                    uri = op_dict.get('response', {}).get('generated_videos', [{}])[0].get('video', {}).get('uri')
+                    # Extract result from the native operation result object
+                    if operation.result and operation.result.generated_videos:
+                        uri = operation.result.generated_videos[0].video.uri
                     break
-                await asyncio.sleep(5)
-                # Operation Get with Retry for 503s
-                operation = await asyncio.to_thread(client.operations.get, operation=operation)
+                    
+                await asyncio.sleep(8) # Wait slightly longer between polls
             except Exception as e:
                 if "503" in str(e):
-                    logger.warning("Veo 3: 503 error during polling, retrying in 5s...")
+                    logger.warning("Veo 3: 503 error during polling, retrying...")
                     await asyncio.sleep(5)
                 else:
                     raise e
             retries += 1
             
         if done and uri:
-            logger.info(f"Veo 3: Done generating! Downloading remote cloud file...")
+            logger.info(f"Veo 3: Success! Downloading motion asset...")
             # Download the MP4 bytes from the googleapis URI silently ignoring SSL 
             async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
                 headers = {'x-goog-api-key': api_key}
@@ -115,7 +184,7 @@ async def generate_video_mock(image_path: str, style: str, hero_product: str) ->
             logger.info(f"Veo 3: Download complete. Saved to {filepath}")
             return filepath
         else:
-            raise Exception(f"Operation failed or timed out. Last API State: {op_dict}")
+            raise Exception(f"Operation failed or timed out. URI: {uri}")
             
     except Exception as e:
         logger.error(f"Veo generation failed: {e}. Falling back to an Image-based mock video sequence.")
@@ -137,10 +206,10 @@ async def generate_video_mock(image_path: str, style: str, hero_product: str) ->
         
     return filepath
 
-async def generate_music_mock(bpm: int, vibe: str) -> str:
+async def generate_music_mock(bpm: int, vibe: str, task_id: str) -> str:
     """Generates a professional instrumental soundtrack using Lyria 3."""
     logger.info(f"Lyria 3: Generating music ({bpm} BPM, {vibe})...")
-    filepath = "tmp/mock_lyria_audio.mp3"
+    filepath = f"tmp/music_{task_id}.mp3"
     
     try:
         api_key = os.getenv("GEMINI_API_KEY")
@@ -148,7 +217,9 @@ async def generate_music_mock(bpm: int, vibe: str) -> str:
         
         # We simplify the prompt to focus on what we WANT (instrumental textures) 
         # to avoid triggering the safety filters with words like 'vocals' or 'singers'.
-        prompt = f"Purely instrumental background music, {vibe}, {bpm} BPM, high-quality corporate acoustic textures."
+        # USE SAFER PROMPTS: Avoid any mention of vocals, singers, or specific artists
+        # Focus on "atmospheric textures" and "orchestral layers"
+        prompt = f"Atmospheric instrumental background, {vibe} textures, {bpm} BPM, high-quality digital soundscape, no vocals, purely rhythmic and melodic layers."
         
         response = await asyncio.to_thread(
             client.models.generate_content,
@@ -156,8 +227,13 @@ async def generate_music_mock(bpm: int, vibe: str) -> str:
             contents=prompt
         )
         
+        # Check if the model refused or returned safety blocks
+        if response.candidates and response.candidates[0].finish_reason == 'SAFETY':
+             logger.warning(f"Lyria 3: Generation blocked by Safety Filters for prompt: {prompt}")
+             raise Exception("AI Safety Block: Music generation was restricted. Using fallback.")
+
         # Robust part extraction for Lyria's multimodal response
-        if response.candidates and response.candidates[0].content.parts:
+        if response.candidates and response.candidates[0].content and getattr(response.candidates[0].content, 'parts', None):
             for part in response.candidates[0].content.parts:
                 if hasattr(part, 'inline_data') and part.inline_data:
                     audio_bytes = part.inline_data.data
@@ -165,6 +241,8 @@ async def generate_music_mock(bpm: int, vibe: str) -> str:
                         f.write(audio_bytes)
                     logger.info(f"Lyria 3: Success! Music saved to {filepath}")
                     return filepath
+                elif hasattr(part, 'text') and part.text:
+                    logger.warning(f"Lyria 3 returned text instead of audio: {part.text}")
                 
         raise Exception("Lyria returned successfully but no audio data was found in response parts.")
     except Exception as e:
@@ -184,10 +262,10 @@ async def generate_music_mock(bpm: int, vibe: str) -> str:
 
     return filepath
 
-async def generate_tts_mock(narration: str) -> str:
+async def generate_tts_mock(narration: str, task_id: str) -> str:
     """Generates real voice narration using gTTS."""
     logger.info(f"TTS Engine: Generating narration: {narration[:20]}...")
-    filepath = "tmp/mock_tts_audio.mp3"
+    filepath = f"tmp/tts_{task_id}.mp3"
     try:
         import gtts
         def save_tts():
@@ -203,13 +281,21 @@ async def generate_tts_mock(narration: str) -> str:
             AudioArrayClip(np.column_stack((array, array)), fps=44100).write_audiofile(filepath, logger=None)
     except Exception as e:
         logger.error(f"Failed to create TTS: {e}")
+        # Create silent audio fallback so synthesizer doesn't crash
+        try:
+            duration = 4
+            t = np.linspace(0, duration, int(44100 * duration))
+            array = np.zeros_like(t)
+            AudioArrayClip(np.column_stack((array, array)), fps=44100).write_audiofile(filepath, logger=None)
+        except Exception as fallback_e:
+            logger.error(f"Even TTS fallback failed: {fallback_e}")
 
     return filepath
 
-async def generate_text_overlay(text: str, index: int) -> str:
+async def generate_text_overlay(text: str, index: int, task_id: str) -> str:
     """Generates a transparent PNG with marketing punchline using Pillow."""
     logger.info(f"Text Engine: Generating punchline overlay: {text}...")
-    filepath = f"tmp/punchline_overlay_{index}.png"
+    filepath = f"tmp/punchline_{task_id}_{index}.png"
     
     # 1280x720 canvas
     img = Image.new('RGBA', (1280, 720), (0, 0, 0, 0))

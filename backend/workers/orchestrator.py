@@ -8,72 +8,149 @@ from backend.workers.generators import (
     generate_video_mock,
     generate_music_mock,
     generate_tts_mock,
-    generate_text_overlay
+    generate_text_overlay,
+    rank_images
 )
 from backend.synthesizer.engine import synthesize_ad
 
 logger = logging.getLogger(__name__)
 
+# Track tasks currently being processed to avoid duplicate triggers from the Firebase listener
+processing_tasks = set()
+
 async def process_task(task_id: str, data: dict):
     """
     Orchestrates the parallel generation and the final synthesis.
     """
-    logger.info(f"Orchestrator: Processing task {task_id}")
-    db_client.update_data(f"/tasks/{task_id}", {"status": "generating"})
-    
-    style_contract = data.get("style_contract", {})
-    
-    # Extract values from style contract
-    prompts = style_contract.get("prompts_for_images", [])
-    bpm = style_contract.get("audio_bpm", 120)
-    vibe = style_contract.get("audio_vibe", "Electronic")
-    narrative = style_contract.get("tts_narration", "Welcome.")
-    visual_style = style_contract.get("visual_style", "Cinematic")
-    hero_product = style_contract.get("hero_product", "Product")
-    punchlines = style_contract.get("ad_punchlines", ["Amazing Brand", "Quality Service", "Check us Out"])
-
-
-    # Define parallel tasks
-    async def video_pipeline():
-        images = await generate_images_mock(prompts)
-        # We now keep ALL images for the slideshow collage
-        best_image = images[0] if images else "tmp/mock_image_0.jpg"
-        video_path = await generate_video_mock(best_image, visual_style, hero_product)
-        return video_path, images or [best_image]
-
-    # Run pipelines concurrently
-    video_task = asyncio.create_task(video_pipeline())
-    audio_task = asyncio.create_task(generate_music_mock(bpm, vibe))
-    tts_task = asyncio.create_task(generate_tts_mock(narrative))
-    
-    async def punchline_pipeline():
-        overlay_paths = []
-        for i, text in enumerate(punchlines):
-            path = await generate_text_overlay(text, i)
-            overlay_paths.append(path)
-        return overlay_paths
-    
-    punchline_task = asyncio.create_task(punchline_pipeline())
-
-    logger.info("Orchestrator: Waiting for parallel generation to finish...")
-    (video_path, image_paths), audio_path, tts_path, overlay_paths = await asyncio.gather(
-        video_task, audio_task, tts_task, punchline_task
-    )
-    logger.info("Orchestrator: All GENERATION complete. Starting Synthesis.")
-
-    db_client.update_data(f"/tasks/{task_id}", {"status": "synthesizing"})
-
-    # Trigger Synthesizer
+    if task_id in processing_tasks:
+        logger.warning(f"Orchestrator: Task {task_id} is already being processed. Skipping.")
+        return
+        
+    processing_tasks.add(task_id)
     try:
-        final_video = await synthesize_ad(task_id, video_path, image_paths, audio_path, tts_path, overlay_paths)
-        logger.info(f"Orchestrator: Synthesis complete: {final_video}")
-        db_client.update_data(f"/tasks/{task_id}", {
-            "status": "completed",
-            "final_video_url": final_video
-        })
-    except Exception as e:
-        logger.error(f"Orchestrator: Synthesis failed: {e}")
-        db_client.update_data(f"/tasks/{task_id}", {"status": "failed", "error": str(e)})
+        # Refetch the complete task data to ensure we have the full style_contract
+        # in case the event only contained a partial update.
+        data = db_client.get_data(f"/tasks/{task_id}")
+        if not data:
+            logger.error(f"Orchestrator: Task {task_id} not found in DB.")
+            return
+
+        logger.info(f"Orchestrator: Processing task {task_id}")
+        db_client.update_data(f"/tasks/{task_id}", {"status": "generating", "progress": 10})
+    
+        style_contract = data.get("style_contract", {})
+        
+        # Extract values from style contract
+        prompts = style_contract.get("prompts_for_images", [])
+        bpm = style_contract.get("audio_bpm", 120)
+        vibe = style_contract.get("audio_vibe", "Electronic")
+        narrative = style_contract.get("tts_narration", "Welcome.")
+        visual_style = style_contract.get("visual_style", "Cinematic")
+        hero_product = style_contract.get("hero_product", "Product")
+        punchlines = style_contract.get("ad_punchlines", ["Amazing Brand", "Quality Service", "Check us Out"])
+
+
+        # Define parallel tasks
+        async def video_pipeline():
+            images = await generate_images_mock(prompts, task_id)
+            
+            # Find the absolute best image using the Smart Ranker
+            best_index = 0
+            if images and len(images) > 1:
+                try:
+                    best_index = await rank_images(images, hero_product, task_id)
+                except Exception as e:
+                    logger.error(f"Smart ranking crash handled: {e}")
+                    
+            best_image = images[best_index] if images else f"tmp/nano_banana_image_{task_id}_0.png"
+            video_path = await generate_video_mock(best_image, visual_style, hero_product, task_id)
+            return video_path, images or [best_image]
+
+        # Run pipelines concurrently
+        video_task = asyncio.create_task(video_pipeline())
+        audio_task = asyncio.create_task(generate_music_mock(bpm, vibe, task_id))
+        tts_task = asyncio.create_task(generate_tts_mock(narrative, task_id))
+        
+        async def punchline_pipeline():
+            overlay_paths = []
+            for i, text in enumerate(punchlines):
+                path = await generate_text_overlay(text, i, task_id)
+                overlay_paths.append(path)
+            return overlay_paths
+        
+        punchline_task = asyncio.create_task(punchline_pipeline())
+
+        # Background simulated progress while waiting for high-latency cloud rendering
+        async def progress_simulator():
+            progress = 10
+            try:
+                while progress < 85:
+                    await asyncio.sleep(3)
+                    # Safety check: don't overwrite success/synthesis status
+                    current = db_client.get_data(f"/tasks/{task_id}")
+                    if current and current.get("status") not in ["generating", "pending_generation"]:
+                        break
+                    
+                    progress += 2
+                    db_client.update_data(f"/tasks/{task_id}", {"progress": progress})
+            except asyncio.CancelledError:
+                pass
+
+        progress_task = asyncio.create_task(progress_simulator())
+
+        logger.info("Orchestrator: Waiting for parallel generation to finish...")
+        (video_path, image_paths), audio_path, tts_path, overlay_paths = await asyncio.gather(
+            video_task, audio_task, tts_task, punchline_task
+        )
+        progress_task.cancel()
+        logger.info("Orchestrator: All GENERATION complete. Starting Synthesis.")
+
+        db_client.update_data(f"/tasks/{task_id}", {"status": "synthesizing", "progress": 90})
+
+        # Trigger Synthesizer
+        try:
+            final_video = await synthesize_ad(task_id, video_path, image_paths, audio_path, tts_path, overlay_paths)
+            logger.info(f"Orchestrator: Synthesis complete: {final_video}")
+            db_client.update_data(f"/tasks/{task_id}", {
+                "status": "completed",
+                "final_video_url": final_video,
+                "progress": 100
+            })
+        except Exception as e:
+            logger.error(f"Orchestrator: Synthesis failed: {e}")
+            db_client.update_data(f"/tasks/{task_id}", {"status": "failed", "error": str(e)})
+    except RuntimeError as e:
+        if "interpreter shutdown" in str(e).lower() or "new futures" in str(e).lower():
+            logger.warning(f"Orchestrator: Shutdown detected during task {task_id}. Cleaning up silently.")
+        else:
+            # STATUS GUARD: Don't set failed if already completed
+            current = db_client.get_data(f"/tasks/{task_id}")
+            if current and current.get("status") == "completed":
+                 logger.info(f"Orchestrator: Ignoring RuntimeError for {task_id} as it is already COMPLETED.")
+            else:
+                logger.error(f"Orchestrator: Runtime error processing task {task_id}: {e}")
+                db_client.update_data(f"/tasks/{task_id}", {
+                    "status": "failed",
+                    "error": str(e)
+                })
+    except Exception as outer_e:
+        # STATUS GUARD: Don't set failed if already completed
+        current = db_client.get_data(f"/tasks/{task_id}")
+        if current and current.get("status") == "completed":
+             logger.info(f"Orchestrator: Ignoring Exception for {task_id} as it is already COMPLETED.")
+        else:
+            logger.error(f"Orchestrator: Pipeline crashed for {task_id}: {outer_e}")
+            db_client.update_data(f"/tasks/{task_id}", {
+                "status": "failed", 
+                "error": str(outer_e)
+            })
+    finally:
+        if task_id in processing_tasks:
+            processing_tasks.remove(task_id)
+            logger.info(f"Orchestrator: Task {task_id} removed from active processing set.")
+        # Ensure progress task is cancelled if we exit early
+        if 'progress_task' in locals() and not progress_task.done():
+            progress_task.cancel()
 
 
 def _run_async_in_thread(coroutine):
@@ -113,6 +190,7 @@ def handle_firebase_event(event: Any):
             _run_async_in_thread(process_task(task_id, data))
     else:
         # Multiple tasks might be present (e.g. init event of the root /tasks path)
-        for task_id, task_data in data.items():
+        for t_id, task_data in data.items():
             if isinstance(task_data, dict) and task_data.get("status") == "pending_generation":
-                _run_async_in_thread(process_task(task_id, task_data))
+                if t_id not in processing_tasks:
+                     _run_async_in_thread(process_task(t_id, task_data))
